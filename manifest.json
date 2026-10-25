@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "id": "mhawar.taskwarrior",
+  "name": "Taskwarrior",
+  "version": "1.0.0",
+  "author": "Mhawar",
+  "license": "MIT",
+  "description": "Taskwarrior and Timewarrior time tracking in the Omarchy bar with Toggl-style 'What are you working on?' prompt, live timer, and task manager popup.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Taskwarrior",
+    "description": "Toggl-style active task timer and Taskwarrior task manager.",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "idlePrompt": "What are you working on?",
+      "idleColor": "#ff5555",
+      "idleReminderMinutes": 15,
+      "autoStopAdhan": true
+    },
+    "schema": [
+      {
+        "key": "idlePrompt",
+        "type": "string",
+        "label": "Idle prompt text",
+        "defaultValue": "What are you working on?",
+        "description": "Message shown in the status bar when no task is currently active."
+      },
+      {
+        "key": "idleColor",
+        "type": "string",
+        "label": "Idle prompt color (red)",
+        "defaultValue": "#ff5555",
+        "description": "Color used for the prompt and icon when not tracking."
+      },
+      {
+        "key": "idleReminderMinutes",
+        "type": "integer",
+        "label": "Idle reminder interval (minutes)",
+        "defaultValue": 15,
+        "description": "Send a desktop notification every N minutes when idle."
+      },
+      {
+        "key": "autoStopAdhan",
+        "type": "boolean",
+        "label": "Auto-stop at Adhan",
+        "defaultValue": true,
+        "description": "Automatically stop active time tracking at prayer times (Fajr, Dhuhr, Asr, Maghrib, Isha)."
+      }
+    ]
+  }
+}

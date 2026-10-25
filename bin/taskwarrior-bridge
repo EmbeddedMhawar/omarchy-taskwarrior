@@ -1,0 +1,786 @@
+#!/usr/bin/env python3
+"""Taskwarrior and Timewarrior bridge for Omarchy Quickshell."""
+
+import sys
+import os
+import json
+import re
+import subprocess
+import datetime
+from pathlib import Path
+
+STATE_DIR = Path.home() / ".local" / "state" / "taskwarrior-omarchy"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+CONFIG_FILE = STATE_DIR / "config.json"
+
+def get_adhan_config() -> bool:
+    if CONFIG_FILE.exists():
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text())
+            return cfg.get("auto_stop_adhan", True)
+        except Exception:
+            pass
+    return True
+
+def set_adhan_config(enabled: bool):
+    cfg = {"auto_stop_adhan": bool(enabled)}
+    try:
+        CONFIG_FILE.write_text(json.dumps(cfg))
+    except Exception:
+        pass
+
+def parse_iso(ts_str: str) -> datetime.datetime:
+    """Parse Taskwarrior/Timewarrior ISO-like timestamp: YYYYMMDDTHHMMSSZ."""
+    if not ts_str:
+        return datetime.datetime.now(datetime.timezone.utc)
+    ts_str = ts_str.strip()
+    try:
+        return datetime.datetime.strptime(ts_str, "%Y%m%dT%H%M%SZ").replace(tzinfo=datetime.timezone.utc)
+    except Exception:
+        try:
+            return datetime.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        except Exception:
+            return datetime.datetime.now(datetime.timezone.utc)
+
+def run_cmd(args):
+    try:
+        res = subprocess.run(args, capture_output=True, text=True)
+        return res.returncode, res.stdout, res.stderr
+    except Exception as e:
+        return 1, "", str(e)
+
+def parse_payload(raw: str) -> dict:
+    raw = raw.strip()
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    project = None
+    # Match project:<value> or pro:<value>
+    m_proj = re.search(r"(?:^|\s)(?:project|pro):([^\s]+)", raw, re.IGNORECASE)
+    if m_proj:
+        project = m_proj.group(1).strip()
+        raw = (raw[:m_proj.start()] + " " + raw[m_proj.end():]).strip()
+
+    priority = None
+    # Match priority:<value> or prio:<value>
+    m_prio = re.search(r"(?:^|\s)(?:priority|prio):([HhMmLl]|none)", raw, re.IGNORECASE)
+    if m_prio:
+        prio_val = m_prio.group(1).upper()
+        priority = "" if prio_val == "NONE" else prio_val
+        raw = (raw[:m_prio.start()] + " " + raw[m_prio.end():]).strip()
+
+    # 3. Match +project syntax (e.g. +Clipping or +Bndar)
+    if project is None:
+        m_tag = re.search(r"(?:^|\s)\+([a-zA-Z0-9_-]+)", raw)
+        if m_tag:
+            tag_name = m_tag.group(1)
+            known_projects = get_projects()
+            for kp in known_projects:
+                if kp.lower() == tag_name.lower():
+                    project = kp
+                    raw = (raw[:m_tag.start()] + " " + raw[m_tag.end():]).strip()
+                    break
+
+    # 4. Match prefix "<Project>: <task>" or "<Project> - <task>" or "<Project> <task>"
+    if project is None and raw:
+        known_projects = get_projects()
+        for kp in known_projects:
+            m_pre = re.match(r"^" + re.escape(kp) + r"[\s:\-]+(.*)$", raw, re.IGNORECASE)
+            if m_pre and m_pre.group(1).strip():
+                project = kp
+                raw = m_pre.group(1).strip()
+                break
+
+    # Clean up excess spaces
+    raw = re.sub(r"\s+", " ", raw).strip()
+
+    payload = {"description": raw}
+    if project is not None:
+        payload["project"] = project
+    if priority is not None:
+        payload["priority"] = priority
+    return payload
+
+def get_projects() -> list:
+    code, stdout, _ = run_cmd(["task", "_projects"])
+    if code == 0 and stdout.strip():
+        return [p.strip() for p in stdout.splitlines() if p.strip()]
+    return []
+
+def modify_task_in_taskwarrior(task_id: int, payload: dict):
+    cmd = ["task", "rc.confirmation=no", str(task_id), "modify"]
+    if "description" in payload and payload["description"] is not None:
+        cmd.append(f"description:{payload['description']}")
+    if "project" in payload:
+        proj = str(payload["project"]).strip()
+        cmd.append(f"project:{proj}")
+    if "priority" in payload:
+        prio = str(payload["priority"]).strip().upper()
+        if prio in ("H", "M", "L"):
+            cmd.append(f"priority:{prio}")
+        elif prio in ("", "NONE"):
+            cmd.append("priority:")
+    run_cmd(cmd)
+
+def parse_new_start_time(spec: str, current_start_dt: datetime.datetime) -> datetime.datetime:
+    now_local = datetime.datetime.now()
+    spec = spec.strip().lower()
+
+    # 1. Delta like +15m, -15m, +30, -5, +1h
+    if spec.startswith("+") or spec.startswith("-"):
+        sign = 1 if spec.startswith("+") else -1
+        is_hours = "h" in spec
+        clean = re.sub(r"[^0-9.]", "", spec)
+        try:
+            val = float(clean)
+            delta = datetime.timedelta(hours=val) if is_hours else datetime.timedelta(minutes=val)
+            # +15m means start 15 min earlier (more elapsed time)
+            # -15m means start 15 min later (less elapsed time)
+            return current_start_dt - delta if sign == 1 else current_start_dt + delta
+        except Exception:
+            pass
+
+    # 2. Relative "20m ago" or "20 mins ago" or "20m"
+    if "ago" in spec or (spec.endswith("m") and ":" not in spec):
+        clean = re.sub(r"[^0-9.]", "", spec)
+        try:
+            val = float(clean)
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            return now_utc - datetime.timedelta(minutes=val)
+        except Exception:
+            pass
+
+    # 3. Absolute time "HH:MM" or "HH:MM:SS" (e.g. 06:45, 14:30)
+    m = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$", spec)
+    if m:
+        h, mn = int(m.group(1)), int(m.group(2))
+        s = int(m.group(3)) if m.group(3) else 0
+        local_dt = now_local.replace(hour=h, minute=mn, second=s, microsecond=0)
+        return local_dt.astimezone(datetime.timezone.utc)
+
+    return current_start_dt
+
+def parse_new_stop_time(spec: str, current_end_dt: datetime.datetime, start_dt: datetime.datetime, now_utc: datetime.datetime) -> datetime.datetime:
+    now_local = datetime.datetime.now()
+    spec = spec.strip().lower()
+    target_dt = current_end_dt
+
+    # 1. Delta like +15m, -15m, +30m, -5, +1h
+    if spec.startswith("+") or spec.startswith("-"):
+        sign = 1 if spec.startswith("+") else -1
+        is_hours = "h" in spec
+        clean = re.sub(r"[^0-9.]", "", spec)
+        try:
+            val = float(clean)
+            delta = datetime.timedelta(hours=val) if is_hours else datetime.timedelta(minutes=val)
+            # +15m means stop 15 min later (more elapsed time)
+            # -15m means stop 15 min earlier (less elapsed time)
+            target_dt = current_end_dt + delta if sign == 1 else current_end_dt - delta
+        except Exception:
+            pass
+    elif "ago" in spec or (spec.endswith("m") and ":" not in spec):
+        clean = re.sub(r"[^0-9.]", "", spec)
+        try:
+            val = float(clean)
+            target_dt = now_utc - datetime.timedelta(minutes=val)
+        except Exception:
+            pass
+    else:
+        m = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$", spec)
+        if m:
+            h, mn = int(m.group(1)), int(m.group(2))
+            s = int(m.group(3)) if m.group(3) else 0
+            local_dt = now_local.replace(hour=h, minute=mn, second=s, microsecond=0)
+            target_dt = local_dt.astimezone(datetime.timezone.utc)
+
+    # Clamping / Safety validation:
+    # 1. Must be at least 1 second after start_dt
+    min_end = start_dt + datetime.timedelta(seconds=1)
+    if target_dt <= min_end:
+        target_dt = min_end
+    # 2. Cannot exceed now_utc
+    if target_dt > now_utc:
+        target_dt = now_utc
+
+    return target_dt
+
+def get_prayer_times() -> dict:
+    """Returns today's prayer times {name: 'HH:MM'} for Casablanca (Moroccan Habous)."""
+    state_dir = Path.home() / ".local" / "state" / "fajr-alarm"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    now = datetime.datetime.now()
+    cache_path = state_dir / f"{now.year:04d}-{now.month:02d}.json"
+
+    if not cache_path.exists() or cache_path.stat().st_size == 0:
+        try:
+            url = f"https://api.aladhan.com/v1/calendar/{now.year}/{now.month}?latitude=33.5731&longitude=-7.5898&method=21"
+            import urllib.request
+            req = urllib.request.Request(url, headers={"User-Agent": "omarchy-taskwarrior/1.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = resp.read()
+                cache_path.write_bytes(data)
+        except Exception:
+            pass
+
+    if not cache_path.exists():
+        return {}
+
+    try:
+        data = json.loads(cache_path.read_text())
+        today_str = now.strftime("%d-%m-%Y")
+        for item in data.get("data", []):
+            if item.get("date", {}).get("gregorian", {}).get("date") == today_str:
+                timings = item.get("timings", {})
+                prayers = {}
+                for name in ["Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"]:
+                    if name in timings:
+                        prayers[name] = timings[name].split()[0]
+                return prayers
+    except Exception:
+        pass
+    return {}
+
+def get_next_prayer(prayers: dict):
+    now = datetime.datetime.now()
+    order = ["Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"]
+    for name in order:
+        if name not in prayers:
+            continue
+        try:
+            p_time = datetime.datetime.strptime(prayers[name], "%H:%M").time()
+            p_dt = datetime.datetime.combine(now.date(), p_time)
+            if p_dt > now:
+                mins = int((p_dt - now).total_seconds() / 60)
+                return {"name": name, "time": prayers[name], "minutes": mins}
+        except Exception:
+            pass
+    # If all prayers passed today, next is Fajr tomorrow
+    if "Fajr" in prayers:
+        return {"name": "Fajr (Tomorrow)", "time": prayers["Fajr"], "minutes": None}
+    return None
+
+def check_and_auto_stop_adhan(active: dict, prayers: dict) -> bool:
+    """If an active task started before an Adhan that has passed, stop it at Adhan time."""
+    if not active or not prayers:
+        return False
+
+    if not get_adhan_config():
+        return False
+
+    now_local = datetime.datetime.now()
+    start_dt_utc = parse_iso(active.get("start", ""))
+    start_dt_local = start_dt_utc.astimezone()
+
+    order = ["Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"]
+    for name in order:
+        if name not in prayers:
+            continue
+        try:
+            p_time = datetime.datetime.strptime(prayers[name], "%H:%M").time()
+            p_dt_local = datetime.datetime.combine(now_local.date(), p_time).replace(tzinfo=start_dt_local.tzinfo)
+
+            # Task started before this prayer, and current time is >= this prayer
+            if start_dt_local < p_dt_local <= now_local.replace(tzinfo=start_dt_local.tzinfo):
+                desc = active.get("description", "Active task")
+                # 1. Stop Taskwarrior
+                run_cmd(["task", "rc.confirmation=no", "+ACTIVE", "stop"])
+                # 2. Stop Timewarrior
+                run_cmd(["timew", "stop", ":yes"])
+                # 3. Set end time of @1 to exact prayer time
+                p_time_str = p_dt_local.strftime("%H:%M:%S")
+                run_cmd(["timew", "modify", "end", "@1", p_time_str, ":adjust", ":yes"])
+
+                # 4. Notify user
+                try:
+                    subprocess.Popen([
+                        "notify-send",
+                        "-u", "normal",
+                        "-a", "Taskwarrior",
+                        "-i", "alarm",
+                        f"Task Stopped for {name} Adhan",
+                        f"Automatically stopped '{desc}' at {prayers[name]} for prayer."
+                    ])
+                except Exception:
+                    pass
+                return True
+        except Exception:
+            pass
+
+    return False
+
+def get_today_seconds() -> int:
+    """Calculate total tracked seconds today from Timewarrior."""
+    code, stdout, _ = run_cmd(["timew", "export", ":today"])
+    if code != 0 or not stdout.strip():
+        return 0
+    total = 0
+    now = datetime.datetime.now(datetime.timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    try:
+        intervals = json.loads(stdout)
+        for item in intervals:
+            start_dt = parse_iso(item.get("start", ""))
+            if "end" in item:
+                end_dt = parse_iso(item["end"])
+            else:
+                end_dt = now
+            # Clamp to today
+            effective_start = max(start_dt, today_start)
+            effective_end = max(end_dt, today_start)
+            delta = (effective_end - effective_start).total_seconds()
+            if delta > 0:
+                total += int(delta)
+    except Exception:
+        pass
+    return total
+
+def get_last_entry() -> dict:
+    """Retrieve the most recent closed interval."""
+    code, stdout, _ = run_cmd(["timew", "export", ":today"])
+    if code != 0 or not stdout.strip():
+        code, stdout, _ = run_cmd(["timew", "export"])
+    if code != 0 or not stdout.strip():
+        return None
+    try:
+        intervals = json.loads(stdout)
+        if not intervals:
+            return None
+        is_active = ("end" not in intervals[-1])
+        closed = [i for i in intervals if "end" in i]
+        if not closed:
+            return None
+        last = closed[-1]
+        timew_cli_id = "@2" if is_active else "@1"
+        start_dt = parse_iso(last.get("start", ""))
+        end_dt = parse_iso(last.get("end", ""))
+        delta_sec = max(0, int((end_dt - start_dt).total_seconds()))
+        tags = last.get("tags", [])
+        desc = " ".join(tags) if tags else "Untitled task"
+        return {
+            "id": timew_cli_id,
+            "description": desc,
+            "start": last.get("start", ""),
+            "start_epoch": int(start_dt.timestamp()),
+            "start_time_local": start_dt.astimezone().strftime("%H:%M"),
+            "end": last.get("end", ""),
+            "end_epoch": int(end_dt.timestamp()),
+            "end_time_local": end_dt.astimezone().strftime("%H:%M"),
+            "duration_seconds": delta_sec
+        }
+    except Exception:
+        return None
+
+def group_pending_tasks(pending: list) -> list:
+    groups = {}
+    order = []
+    prio_rank = {"H": 3, "M": 2, "L": 1, "": 0}
+    for t in pending:
+        proj = (t.get("project") or "").strip()
+        desc = (t.get("description") or "Untitled task").strip()
+        key = (proj.lower(), desc.lower())
+        if key not in groups:
+            groups[key] = {
+                "id": t["id"],
+                "uuid": t["uuid"],
+                "description": desc,
+                "project": proj,
+                "priority": t.get("priority", ""),
+                "urgency": t.get("urgency", 0),
+                "due": t.get("due", ""),
+                "tags": t.get("tags", []),
+                "count": 1,
+                "ids": [t["id"]],
+                "tasks": [t]
+            }
+            order.append(key)
+        else:
+            g = groups[key]
+            g["count"] += 1
+            g["ids"].append(t["id"])
+            g["tasks"].append(t)
+            if prio_rank.get(t.get("priority", "").upper(), 0) > prio_rank.get(g["priority"].upper(), 0):
+                g["priority"] = t.get("priority", "")
+            if t.get("urgency", 0) > g["urgency"]:
+                g["urgency"] = t["urgency"]
+            if (t.get("id") or 0) > (g.get("id") or 0):
+                g["id"] = t["id"]
+                g["uuid"] = t["uuid"]
+
+    grouped_list = [groups[k] for k in order]
+    grouped_list.sort(key=lambda x: (
+        -prio_rank.get(x.get("priority", "").upper(), 0),
+        x.get("project", "").lower() == "",
+        x.get("project", "").lower(),
+        -x.get("urgency", 0),
+        -(x.get("id") or 0)
+    ))
+    return grouped_list
+
+def get_status() -> dict:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    active = None
+    pending = []
+
+    # 1. Fetch Taskwarrior tasks
+    code, stdout, _ = run_cmd(["task", "export"])
+    tasks = []
+    if code == 0 and stdout.strip():
+        try:
+            tasks = json.loads(stdout)
+        except Exception:
+            tasks = []
+
+    for t in tasks:
+        status = t.get("status", "")
+        if status == "pending":
+            if "start" in t:
+                # Active Taskwarrior task
+                start_dt = parse_iso(t["start"])
+                elapsed = max(0, int((now - start_dt).total_seconds()))
+                active = {
+                    "id": t.get("id"),
+                    "uuid": t.get("uuid", ""),
+                    "description": t.get("description", "Untitled task"),
+                    "project": t.get("project", ""),
+                    "priority": t.get("priority", ""),
+                    "tags": t.get("tags", []),
+                    "start": t["start"],
+                    "start_epoch": int(start_dt.timestamp()),
+                    "start_time_local": start_dt.astimezone().strftime("%H:%M"),
+                    "elapsed_seconds": elapsed,
+                    "source": "taskwarrior"
+                }
+            else:
+                pending.append({
+                    "id": t.get("id"),
+                    "uuid": t.get("uuid", ""),
+                    "description": t.get("description", "Untitled task"),
+                    "project": t.get("project", ""),
+                    "priority": t.get("priority", ""),
+                    "tags": t.get("tags", []),
+                    "urgency": round(float(t.get("urgency", 0)), 1),
+                    "due": t.get("due", "")
+                })
+
+    # Sort pending by urgency descending, then ID
+    pending.sort(key=lambda x: (x.get("urgency", 0), -(x.get("id") or 0)), reverse=True)
+
+    # 2. Check Timewarrior if no active in Taskwarrior
+    if not active:
+        t_code, t_stdout, _ = run_cmd(["timew", "export"])
+        if t_code == 0 and t_stdout.strip():
+            try:
+                intervals = json.loads(t_stdout)
+                if intervals and "end" not in intervals[-1]:
+                    current = intervals[-1]
+                    start_dt = parse_iso(current.get("start", ""))
+                    elapsed = max(0, int((now - start_dt).total_seconds()))
+                    tags = current.get("tags", [])
+                    desc = " ".join(tags) if tags else "Active time tracking"
+                    active = {
+                        "id": None,
+                        "uuid": "",
+                        "description": desc,
+                        "project": "",
+                        "tags": tags,
+                        "start": current.get("start", ""),
+                        "start_epoch": int(start_dt.timestamp()),
+                        "start_time_local": start_dt.astimezone().strftime("%H:%M"),
+                        "elapsed_seconds": elapsed,
+                        "source": "timewarrior"
+                    }
+            except Exception:
+                pass
+
+    # 3. Check Prayer times & Adhan auto-stop
+    prayers = get_prayer_times()
+    next_prayer = get_next_prayer(prayers)
+    auto_stop_adhan = get_adhan_config()
+
+    if active and auto_stop_adhan:
+        stopped = check_and_auto_stop_adhan(active, prayers)
+        if stopped:
+            active = None
+
+    last_entry = get_last_entry()
+    today_sec = get_today_seconds()
+
+    raw_pending_count = len(pending)
+    grouped_pending = group_pending_tasks(pending)
+
+    return {
+        "ok": True,
+        "active": active,
+        "last_entry": last_entry,
+        "pending": grouped_pending[:30],
+        "total_pending": len(grouped_pending),
+        "total_raw_pending": raw_pending_count,
+        "today_seconds": today_sec,
+        "prayers": prayers,
+        "next_prayer": next_prayer,
+        "auto_stop_adhan": auto_stop_adhan,
+        "projects": get_projects()
+    }
+
+def main():
+    if len(sys.argv) < 2:
+        cmd = "status"
+    else:
+        cmd = sys.argv[1]
+
+    if cmd == "status":
+        print(json.dumps(get_status()))
+        return
+
+    if cmd == "start":
+        if len(sys.argv) < 3:
+            print(json.dumps({"ok": False, "error": "Missing task ID or description"}))
+            sys.exit(1)
+        target = sys.argv[2]
+        run_cmd(["task", "rc.confirmation=no", "+ACTIVE", "stop"])
+        run_cmd(["task", "rc.confirmation=no", target, "start"])
+        print(json.dumps(get_status()))
+        return
+
+    if cmd == "start-new":
+        if len(sys.argv) < 3:
+            print(json.dumps({"ok": False, "error": "Missing task description"}))
+            sys.exit(1)
+        raw = " ".join(sys.argv[2:]).strip()
+        payload = parse_payload(raw)
+        run_cmd(["task", "rc.confirmation=no", "+ACTIVE", "stop"])
+        desc = payload.get("description", "").strip() or "New task"
+        proj = str(payload.get("project", "")).strip()
+        prio = str(payload.get("priority", "")).strip().upper()
+
+        # Check if an existing pending task has the exact same description and project
+        status = get_status()
+        existing_id = None
+        for t in status.get("pending", []):
+            t_desc = (t.get("description") or "").strip().lower()
+            t_proj = (t.get("project") or "").strip().lower()
+            if t_desc == desc.lower() and t_proj == proj.lower():
+                existing_id = t.get("id")
+                break
+
+        if existing_id:
+            if prio in ("H", "M", "L", "NONE", ""):
+                modify_task_in_taskwarrior(existing_id, {"priority": prio})
+            run_cmd(["task", "rc.confirmation=no", str(existing_id), "start"])
+        else:
+            cmd_args = ["task", "rc.confirmation=no", "add", desc]
+            if proj:
+                cmd_args.append(f"project:{proj}")
+            if prio in ("H", "M", "L"):
+                cmd_args.append(f"priority:{prio}")
+            run_cmd(cmd_args)
+            run_cmd(["task", "rc.confirmation=no", "+LATEST", "start"])
+
+        print(json.dumps(get_status()))
+        return
+
+    if cmd == "resume":
+        last = get_last_entry()
+        if not last or not last.get("description"):
+            print(json.dumps({"ok": False, "error": "No recent task to resume"}))
+            sys.exit(1)
+        desc = last["description"]
+        run_cmd(["task", "rc.confirmation=no", "+ACTIVE", "stop"])
+        run_cmd(["task", "rc.confirmation=no", "add", desc])
+        run_cmd(["task", "rc.confirmation=no", "+LATEST", "start"])
+        print(json.dumps(get_status()))
+        return
+
+    if cmd in ("modify-active", "rename", "set-description"):
+        if len(sys.argv) < 3:
+            print(json.dumps({"ok": False, "error": "Missing description or payload"}))
+            sys.exit(1)
+        raw = " ".join(sys.argv[2:]).strip()
+        payload = parse_payload(raw)
+        status = get_status()
+        active = status.get("active")
+        if not active:
+            print(json.dumps({"ok": False, "error": "No active task to rename"}))
+            sys.exit(1)
+
+        if active.get("id"):
+            modify_task_in_taskwarrior(active["id"], payload)
+        else:
+            tags = []
+            if payload.get("description"):
+                tags.append(payload["description"])
+            if payload.get("project"):
+                tags.append(payload["project"])
+            if tags:
+                run_cmd(["timew", "retag", "@1"] + tags)
+
+        print(json.dumps(get_status()))
+        return
+
+    if cmd in ("rename-last", "set-last-description"):
+        if len(sys.argv) < 3:
+            print(json.dumps({"ok": False, "error": "Missing description"}))
+            sys.exit(1)
+        new_desc = " ".join(sys.argv[2:]).strip()
+        last = get_last_entry()
+        if not last:
+            print(json.dumps({"ok": False, "error": "No last entry to rename"}))
+            sys.exit(1)
+        target_id = last.get("id", "@1")
+        run_cmd(["timew", "retag", target_id, new_desc])
+        print(json.dumps(get_status()))
+        return
+
+    if cmd in ("modify-task", "rename-task"):
+        if len(sys.argv) < 4:
+            print(json.dumps({"ok": False, "error": "Usage: modify-task <id> <new_description_or_payload>"}))
+            sys.exit(1)
+        task_id_arg = sys.argv[2]
+        raw = " ".join(sys.argv[3:]).strip()
+        payload = parse_payload(raw)
+        ids = [i.strip() for i in task_id_arg.replace(",", " ").split() if i.strip()]
+        for tid in ids:
+            modify_task_in_taskwarrior(tid, payload)
+        print(json.dumps(get_status()))
+        return
+
+    if cmd == "set-start":
+        if len(sys.argv) < 3:
+            print(json.dumps({"ok": False, "error": "Missing time specification"}))
+            sys.exit(1)
+        spec = " ".join(sys.argv[2:])
+        status = get_status()
+        active = status.get("active")
+
+        if active and active.get("start"):
+            # Modify active task start
+            current_start_dt = parse_iso(active["start"])
+            new_start_dt = parse_new_start_time(spec, current_start_dt)
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            if new_start_dt > now_utc:
+                new_start_dt = now_utc
+            iso_utc = new_start_dt.strftime("%Y%m%dT%H%M%SZ")
+
+            if active.get("id"):
+                run_cmd(["task", "rc.confirmation=no", str(active["id"]), "modify", f"start:{iso_utc}"])
+
+            local_time_str = new_start_dt.astimezone().strftime("%H:%M:%S")
+            run_cmd(["timew", "move", "@1", local_time_str, ":adjust"])
+            print(json.dumps(get_status()))
+            return
+
+        # If idle, modify start time of last completed entry
+        last = status.get("last_entry")
+        if last and last.get("start"):
+            current_start_dt = parse_iso(last["start"])
+            new_start_dt = parse_new_start_time(spec, current_start_dt)
+            end_dt = parse_iso(last["end"])
+            if new_start_dt >= end_dt:
+                new_start_dt = end_dt - datetime.timedelta(seconds=1)
+            local_time_str = new_start_dt.astimezone().strftime("%H:%M:%S")
+            target_id = last.get("id", "@1")
+            run_cmd(["timew", "modify", "start", target_id, local_time_str, ":adjust", ":yes"])
+            print(json.dumps(get_status()))
+            return
+
+        print(json.dumps({"ok": False, "error": "No task to adjust start time"}))
+        sys.exit(1)
+
+    if cmd == "set-stop":
+        if len(sys.argv) < 3:
+            print(json.dumps({"ok": False, "error": "Missing time specification"}))
+            sys.exit(1)
+        spec = " ".join(sys.argv[2:])
+        status = get_status()
+        last = status.get("last_entry")
+        if not last or not last.get("end"):
+            print(json.dumps({"ok": False, "error": "No completed task to adjust stop time"}))
+            sys.exit(1)
+
+        start_dt = parse_iso(last["start"])
+        end_dt = parse_iso(last["end"])
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        new_end_dt = parse_new_stop_time(spec, end_dt, start_dt, now_utc)
+
+        local_time_str = new_end_dt.astimezone().strftime("%H:%M:%S")
+        target_id = last.get("id", "@1")
+        run_cmd(["timew", "modify", "end", target_id, local_time_str, ":adjust", ":yes"])
+        print(json.dumps(get_status()))
+        return
+
+    if cmd == "stop":
+        spec = " ".join(sys.argv[2:]).strip() if len(sys.argv) >= 3 else ""
+        status = get_status()
+        active = status.get("active")
+
+        run_cmd(["task", "rc.confirmation=no", "+ACTIVE", "stop"])
+        run_cmd(["timew", "stop", ":yes"])
+
+        if spec and active and active.get("start"):
+            start_dt = parse_iso(active["start"])
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            new_end_dt = parse_new_stop_time(spec, now_utc, start_dt, now_utc)
+            local_time_str = new_end_dt.astimezone().strftime("%H:%M:%S")
+            run_cmd(["timew", "modify", "end", "@1", local_time_str, ":adjust", ":yes"])
+
+        print(json.dumps(get_status()))
+        return
+
+    if cmd == "toggle-adhan":
+        cur = get_adhan_config()
+        set_adhan_config(not cur)
+        print(json.dumps(get_status()))
+        return
+
+    if cmd == "set-adhan":
+        if len(sys.argv) >= 3:
+            val = sys.argv[2].lower() in ("true", "1", "yes", "on")
+            set_adhan_config(val)
+        print(json.dumps(get_status()))
+        return
+
+    if cmd == "done":
+        if len(sys.argv) < 3:
+            run_cmd(["task", "rc.confirmation=no", "+ACTIVE", "done"])
+            run_cmd(["timew", "stop", ":yes"])
+        else:
+            targets = []
+            for arg in sys.argv[2:]:
+                for t in arg.replace(",", " ").split():
+                    if t.strip():
+                        targets.append(t.strip())
+            run_cmd(["task", "rc.confirmation=no"] + targets + ["done"])
+        print(json.dumps(get_status()))
+        return
+
+    if cmd == "delete":
+        if len(sys.argv) < 3:
+            print(json.dumps({"ok": False, "error": "Missing task ID"}))
+            sys.exit(1)
+        targets = []
+        for arg in sys.argv[2:]:
+            for t in arg.replace(",", " ").split():
+                if t.strip():
+                    targets.append(t.strip())
+        run_cmd(["task", "rc.confirmation=no"] + targets + ["delete"])
+        print(json.dumps(get_status()))
+        return
+
+    if cmd == "add":
+        if len(sys.argv) < 3:
+            print(json.dumps({"ok": False, "error": "Missing task description"}))
+            sys.exit(1)
+        desc = " ".join(sys.argv[2:])
+        run_cmd(["task", "rc.confirmation=no", "add", desc])
+        print(json.dumps(get_status()))
+        return
+
+    print(json.dumps({"ok": False, "error": f"Unknown command: {cmd}"}))
+    sys.exit(1)
+
+if __name__ == "__main__":
+    main()
