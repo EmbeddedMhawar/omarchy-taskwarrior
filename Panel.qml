@@ -24,6 +24,27 @@ Panel {
   property bool autoStopAdhan: true
   property var pendingTasks: []
   property var knownProjects: []
+  property alias taskInput: taskInputField
+  property var allTaskSuggestions: []
+  property string inputFilterText: ""
+  property int selectedSuggestionIndex: -1
+  readonly property var matchingSuggestions: {
+    var rawText = root.inputFilterText
+    if (rawText.length < 1) return []
+    var query = rawText.toLowerCase()
+    var matches = []
+    var list = root.allTaskSuggestions || []
+    for (var i = 0; i < list.length; i++) {
+      var s = list[i]
+      var desc = String(s.description || "")
+      var proj = String(s.project || "")
+      if (desc.toLowerCase().indexOf(query) !== -1 || proj.toLowerCase().indexOf(query) !== -1) {
+        matches.push(s)
+        if (matches.length >= 5) break
+      }
+    }
+    return matches
+  }
   property int totalPending: 0
   property int totalRawPending: 0
   property int todaySeconds: 0
@@ -92,6 +113,7 @@ Panel {
         root.autoStopAdhan = (res.auto_stop_adhan !== false)
         root.pendingTasks = res.pending || []
         root.knownProjects = res.projects || []
+        root.allTaskSuggestions = res.suggestions || []
         root.totalPending = res.total_pending || 0
         root.totalRawPending = res.total_raw_pending || res.total_pending || 0
         root.todaySeconds = res.today_seconds || 0
@@ -123,6 +145,31 @@ Panel {
 
   function startNewTask(description) {
     runBridge(["start-new", description])
+  }
+
+  function selectSuggestion(s, startImmediately) {
+    if (!s) return
+    var desc = s.description || ""
+    var proj = s.project || ""
+    var prio = s.priority || ""
+
+    if (startImmediately) {
+      var cmd = desc
+      if (proj !== "") cmd += " project:" + proj
+      if (prio !== "") cmd += " priority:" + prio
+      root.startNewTask(cmd)
+      if (taskInputField) taskInputField.text = ""
+      root.selectedSuggestionIndex = -1
+    } else {
+      var completedText = desc
+      if (proj !== "") completedText += " project:" + proj
+      if (prio !== "") completedText += " priority:" + prio
+      if (taskInputField) {
+        taskInputField.text = completedText
+        taskInputField.cursorPosition = completedText.length
+      }
+      root.selectedSuggestionIndex = -1
+    }
   }
 
   function resumeLastTask() {
@@ -203,6 +250,12 @@ Panel {
       root.open()
       root.isEditingTaskText = true
     }
+    function setInput(text: string): void {
+      root.open()
+      if (typeof taskInputField !== "undefined" && taskInputField) {
+        taskInputField.text = text
+      }
+    }
   }
 
   Process {
@@ -263,6 +316,11 @@ Panel {
   onOpenedChanged: {
     if (opened) {
       refresh()
+      Qt.callLater(function() {
+        if (root.taskInput) {
+          root.taskInput.forceActiveFocus()
+        }
+      })
     } else {
       root.isEditingTaskText = false
       root.isEditingLastTracked = false
@@ -311,13 +369,14 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened
-    focusTarget: keyCatcher
+    focusTarget: taskInputField
     contentWidth: panel.fittedContentWidth(Style.space(440))
     contentHeight: panel.fittedContentHeight(mainColumn.implicitHeight)
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      blocked: (root.taskInput && root.taskInput.activeFocus) || root.isEditingTaskText || root.isEditingLastTracked || (root.editingPendingTaskId !== null)
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
@@ -338,11 +397,51 @@ Panel {
             width: parent.width - startBtn.width - Style.space(8)
             placeholderText: "What are you working on? (e.g. Task project:Work priority:H)"
             hasCursor: false
+            onTextChanged: {
+              root.inputFilterText = text.trim()
+              root.selectedSuggestionIndex = -1
+            }
+
+            Keys.onTabPressed: function(event) {
+              if (root.matchingSuggestions.length > 0) {
+                var s = root.matchingSuggestions[root.selectedSuggestionIndex >= 0 ? root.selectedSuggestionIndex : 0]
+                root.selectSuggestion(s, false)
+                event.accepted = true
+              }
+            }
+
+            Keys.onDownPressed: function(event) {
+              if (root.matchingSuggestions.length > 0) {
+                root.selectedSuggestionIndex = Math.min(root.matchingSuggestions.length - 1, root.selectedSuggestionIndex + 1)
+                event.accepted = true
+              }
+            }
+
+            Keys.onUpPressed: function(event) {
+              if (root.matchingSuggestions.length > 0) {
+                root.selectedSuggestionIndex = Math.max(-1, root.selectedSuggestionIndex - 1)
+                event.accepted = true
+              }
+            }
+
+            Keys.onEscapePressed: function(event) {
+              root.selectedSuggestionIndex = -1
+              taskInputField.text = ""
+              event.accepted = true
+            }
+
             onAccepted: {
+              if (root.selectedSuggestionIndex >= 0 && root.selectedSuggestionIndex < root.matchingSuggestions.length) {
+                root.selectSuggestion(root.matchingSuggestions[root.selectedSuggestionIndex], true)
+                text = ""
+                root.selectedSuggestionIndex = -1
+                return
+              }
               var val = text.trim()
               if (val !== "") {
                 root.startNewTask(val)
                 text = ""
+                root.selectedSuggestionIndex = -1
               }
             }
           }
@@ -357,6 +456,144 @@ Panel {
               if (val !== "") {
                 root.startNewTask(val)
                 taskInputField.text = ""
+                root.selectedSuggestionIndex = -1
+              }
+            }
+          }
+        }
+
+        // Auto-complete suggestions box (appears as the user types)
+        BorderSurface {
+          id: suggestionsContainer
+          visible: root.inputFilterText.length >= 1 && root.matchingSuggestions.length > 0
+          width: parent.width
+          implicitHeight: suggestionsCol.implicitHeight + topPadding + bottomPadding
+          height: implicitHeight
+          color: Style.controlFill(false, false, root.barForeground, Commons.Color.accent)
+          radius: Style.cornerRadius
+          borderSpec: Border.controlSpec("focus", root.barForeground, Commons.Color.accent)
+          topPadding: Style.space(6)
+          bottomPadding: Style.space(6)
+          leftPadding: Style.space(8)
+          rightPadding: Style.space(8)
+
+          Column {
+            id: suggestionsCol
+            width: parent.width - Style.space(16)
+            spacing: Style.space(3)
+
+            Row {
+              width: parent.width
+              Text {
+                text: "SUGGESTIONS (Tab to complete, Click to start)"
+                color: Qt.darker(root.barForeground, 1.6)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption - 1
+                font.bold: true
+              }
+            }
+
+            Repeater {
+              model: root.matchingSuggestions
+              delegate: Rectangle {
+                id: suggRow
+                width: suggestionsCol.width
+                implicitHeight: Style.space(28)
+                height: implicitHeight
+                radius: Style.cornerRadius - 2
+                color: (suggHover.hovered || root.selectedSuggestionIndex === index)
+                  ? Style.controlFill(false, true, root.barForeground, Commons.Color.accent)
+                  : "transparent"
+
+                HoverHandler {
+                  id: suggHover
+                }
+
+                TapHandler {
+                  onTapped: root.selectSuggestion(modelData, true)
+                }
+
+                Item {
+                  anchors.fill: parent
+                  anchors.leftMargin: Style.space(6)
+                  anchors.rightMargin: Style.space(6)
+
+                  Row {
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(8)
+
+                    Text {
+                      text: "󰐊"
+                      color: Commons.Color.accent
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    // Priority
+                    Text {
+                      visible: Boolean(modelData.priority)
+                      text: modelData.priority || ""
+                      color: modelData.priority === "H" ? "#ff5555" : (modelData.priority === "M" ? "#e5c07b" : "#61afef")
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    // Project
+                    Row {
+                      visible: Boolean(modelData.project)
+                      spacing: Style.space(3)
+                      anchors.verticalCenter: parent.verticalCenter
+
+                      Text {
+                        text: "📁"
+                        font.pixelSize: Style.font.caption - 1
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+                      Text {
+                        text: modelData.project || ""
+                        color: "#61afef"
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+                    }
+
+                    // Description
+                    Text {
+                      text: modelData.description || ""
+                      color: root.barForeground
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.body
+                      font.bold: true
+                      elide: Text.ElideRight
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+                  }
+
+                  // Start pill on far right
+                  Rectangle {
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    height: Style.space(20)
+                    width: Style.space(48)
+                    radius: Style.cornerRadius - 2
+                    color: Commons.Color.accent
+
+                    Text {
+                      anchors.centerIn: parent
+                      text: "Start"
+                      color: Commons.Color.background
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption - 1
+                      font.bold: true
+                    }
+                  }
+                }
               }
             }
           }
@@ -890,15 +1127,30 @@ Panel {
             }
 
             // Description text (when not editing)
-            Text {
+            Row {
               visible: !root.isEditingLastTracked
               width: parent.width
-              text: root.lastEntry ? String(root.lastEntry.description || "") : ""
-              color: root.barForeground
-              font.family: Style.font.family
-              font.pixelSize: Style.font.body
-              wrapMode: Text.Wrap
-              font.bold: true
+              spacing: Style.space(6)
+
+              Text {
+                visible: root.lastEntry && Boolean(root.lastEntry.project)
+                text: "📁 " + (root.lastEntry ? root.lastEntry.project : "")
+                color: "#61afef"
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Text {
+                text: root.lastEntry ? String(root.lastEntry.description || "") : ""
+                color: root.barForeground
+                font.family: Style.font.family
+                font.pixelSize: Style.font.body
+                wrapMode: Text.Wrap
+                font.bold: true
+                anchors.verticalCenter: parent.verticalCenter
+              }
             }
 
             // Rename trigger button for last tracked task

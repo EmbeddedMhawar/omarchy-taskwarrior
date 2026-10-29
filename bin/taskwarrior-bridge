@@ -107,9 +107,14 @@ def parse_payload(raw: str) -> dict:
 
 def get_projects() -> list:
     code, stdout, _ = run_cmd(["task", "_projects"])
+    projs = set()
     if code == 0 and stdout.strip():
-        return [p.strip() for p in stdout.splitlines() if p.strip()]
-    return []
+        for p in stdout.splitlines():
+            if p.strip():
+                projs.add(p.strip())
+    for p in ["Bndar", "Clipping", "Money"]:
+        projs.add(p)
+    return sorted(list(projs))
 
 def modify_task_in_taskwarrior(task_id: int, payload: dict):
     cmd = ["task", "rc.confirmation=no", str(task_id), "modify"]
@@ -398,7 +403,7 @@ def get_today_seconds() -> int:
     return total
 
 def get_last_entry() -> dict:
-    """Retrieve the most recent closed interval."""
+    """Retrieve the most recent closed interval with clean description and project."""
     code, stdout, _ = run_cmd(["timew", "export", ":today"])
     if code != 0 or not stdout.strip():
         code, stdout, _ = run_cmd(["timew", "export"])
@@ -418,10 +423,36 @@ def get_last_entry() -> dict:
         end_dt = parse_iso(last.get("end", ""))
         delta_sec = max(0, int((end_dt - start_dt).total_seconds()))
         tags = last.get("tags", [])
-        desc = " ".join(tags) if tags else "Untitled task"
+
+        proj = ""
+        desc_tags = []
+        known_projects = get_projects()
+        for tg in tags:
+            if any(tg.lower() == kp.lower() for kp in known_projects):
+                proj = tg
+            else:
+                desc_tags.append(tg)
+
+        desc = " ".join(desc_tags).strip() if desc_tags else ""
+        if not desc and proj:
+            desc = proj
+            proj = ""
+        elif not desc and not proj:
+            desc = "Untitled task"
+
+        # Also clean any accidental prefix: e.g. "Clipping WarmUp Accounts"
+        for kp in known_projects:
+            m = re.match(r"^" + re.escape(kp) + r"[\s:\-]+(.*)$", desc, re.IGNORECASE)
+            if m and m.group(1).strip():
+                if not proj:
+                    proj = kp
+                desc = m.group(1).strip()
+                break
+
         return {
             "id": timew_cli_id,
             "description": desc,
+            "project": proj,
             "start": last.get("start", ""),
             "start_epoch": int(start_dt.timestamp()),
             "start_time_local": start_dt.astimezone().strftime("%H:%M"),
@@ -432,6 +463,91 @@ def get_last_entry() -> dict:
         }
     except Exception:
         return None
+
+def get_task_suggestions() -> list:
+    """Return a list of unique task suggestions with description, project, priority, and use count."""
+    code, stdout, _ = run_cmd(["task", "rc.confirmation=no", "export"])
+    if code != 0 or not stdout.strip():
+        return []
+    catalog = {}
+    known_projs = get_projects()
+    try:
+        tasks = json.loads(stdout)
+        for t in tasks:
+            desc = t.get("description", "").strip()
+            if not desc:
+                continue
+            proj = str(t.get("project") or "").strip()
+            prio = str(t.get("priority") or "").strip().upper()
+
+            # Clean any accidental prefix (e.g. "Clipping WarmUp Accounts")
+            for kp in known_projs:
+                m = re.match(r"^" + re.escape(kp) + r"[\s:\-]+(.*)$", desc, re.IGNORECASE)
+                if m and m.group(1).strip():
+                    if not proj:
+                        proj = kp
+                    desc = m.group(1).strip()
+                    break
+
+            key = (desc.lower(), proj.lower())
+            if key not in catalog:
+                catalog[key] = {
+                    "description": desc,
+                    "project": proj,
+                    "priority": prio,
+                    "count": 1,
+                    "is_pending": (t.get("status") == "pending")
+                }
+            else:
+                catalog[key]["count"] += 1
+                if prio and not catalog[key]["priority"]:
+                    catalog[key]["priority"] = prio
+                if proj and not catalog[key]["project"]:
+                    catalog[key]["project"] = proj
+                if t.get("status") == "pending":
+                    catalog[key]["is_pending"] = True
+
+        code_tw, tw_out, _ = run_cmd(["timew", "export", ":today"])
+        if code_tw == 0 and tw_out.strip():
+            tw_intervals = json.loads(tw_out)
+            for item in tw_intervals:
+                tags = item.get("tags", [])
+                if not tags:
+                    continue
+                tw_proj = ""
+                tw_desc_parts = []
+                for tg in tags:
+                    if any(tg.lower() == kp.lower() for kp in known_projs):
+                        tw_proj = tg
+                    else:
+                        tw_desc_parts.append(tg)
+                tw_desc = " ".join(tw_desc_parts).strip()
+                if not tw_desc and tw_proj:
+                    tw_desc = tw_proj
+                    tw_proj = ""
+                for kp in known_projs:
+                    m = re.match(r"^" + re.escape(kp) + r"[\s:\-]+(.*)$", tw_desc, re.IGNORECASE)
+                    if m and m.group(1).strip():
+                        if not tw_proj:
+                            tw_proj = kp
+                        tw_desc = m.group(1).strip()
+                        break
+                if tw_desc:
+                    key = (tw_desc.lower(), tw_proj.lower())
+                    if key not in catalog:
+                        catalog[key] = {
+                            "description": tw_desc,
+                            "project": tw_proj,
+                            "priority": "",
+                            "count": 1,
+                            "is_pending": False
+                        }
+    except Exception:
+        pass
+
+    suggestions = list(catalog.values())
+    suggestions.sort(key=lambda x: (x.get("is_pending", False), x.get("count", 1)), reverse=True)
+    return suggestions
 
 def group_pending_tasks(pending: list) -> list:
     groups = {}
@@ -585,7 +701,8 @@ def get_status() -> dict:
         "prayers": prayers,
         "next_prayer": next_prayer,
         "auto_stop_adhan": auto_stop_adhan,
-        "projects": get_projects()
+        "projects": get_projects(),
+        "suggestions": get_task_suggestions()
     }
 
 def main():
@@ -651,9 +768,26 @@ def main():
             print(json.dumps({"ok": False, "error": "No recent task to resume"}))
             sys.exit(1)
         desc = last["description"]
+        proj = str(last.get("project") or "").strip()
         run_cmd(["task", "rc.confirmation=no", "+ACTIVE", "stop"])
-        run_cmd(["task", "rc.confirmation=no", "add", desc])
-        run_cmd(["task", "rc.confirmation=no", "+LATEST", "start"])
+
+        status = get_status()
+        existing_id = None
+        for t in status.get("pending", []):
+            t_desc = (t.get("description") or "").strip().lower()
+            t_proj = (t.get("project") or "").strip().lower()
+            if t_desc == desc.lower() and t_proj == proj.lower():
+                existing_id = t.get("id")
+                break
+
+        if existing_id:
+            run_cmd(["task", "rc.confirmation=no", str(existing_id), "start"])
+        else:
+            cmd_args = ["task", "rc.confirmation=no", "add", desc]
+            if proj:
+                cmd_args.append(f"project:{proj}")
+            run_cmd(cmd_args)
+            run_cmd(["task", "rc.confirmation=no", "+LATEST", "start"])
         print(json.dumps(get_status()))
         return
 
