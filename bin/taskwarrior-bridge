@@ -263,6 +263,65 @@ def get_next_prayer(prayers: dict):
         return {"name": "Fajr (Tomorrow)", "time": prayers["Fajr"], "minutes": None}
     return None
 
+def get_overnight_stop_time(start_dt_local: datetime.datetime) -> datetime.datetime:
+    """Find the exact lid-close or system-sleep timestamp after the task started on that day."""
+    cmd = [
+        "journalctl", "-b", "0",
+        "--grep=Lid closed|systemd-sleep",
+        "-o", "short-iso",
+        "--since", start_dt_local.strftime("%Y-%m-%d %H:%M:%S")
+    ]
+    code, out, _ = run_cmd(cmd)
+    if code == 0 and out.strip():
+        for line in out.splitlines():
+            m = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})", line)
+            if m:
+                dt = parse_iso(m.group(1)).astimezone()
+                if dt > start_dt_local:
+                    return dt
+
+    # Fallback: Clamp to midnight of the start day (or start + 2 hours)
+    midnight = datetime.datetime.combine(start_dt_local.date() + datetime.timedelta(days=1), datetime.time(0, 0, 0)).replace(tzinfo=start_dt_local.tzinfo)
+    return min(start_dt_local + datetime.timedelta(hours=2), midnight)
+
+def check_and_auto_stop_overnight(active: dict) -> bool:
+    """If an active task was left running from a previous day, auto-stop it cleanly."""
+    if not active:
+        return False
+
+    now_local = datetime.datetime.now()
+    start_dt_utc = parse_iso(active.get("start", ""))
+    start_dt_local = start_dt_utc.astimezone()
+
+    # Did this active task start on a previous calendar day?
+    if start_dt_local.date() < now_local.date():
+        desc = active.get("description", "Active task")
+        stop_dt = get_overnight_stop_time(start_dt_local)
+
+        # 1. Stop Taskwarrior
+        run_cmd(["task", "rc.confirmation=no", "+ACTIVE", "stop"])
+        # 2. Stop Timewarrior
+        run_cmd(["timew", "stop", ":yes"])
+        # 3. Adjust end time in Timewarrior to the detected stop time (full ISO format)
+        stop_str = stop_dt.strftime("%Y-%m-%dT%H:%M:%S")
+        run_cmd(["timew", "modify", "end", "@1", stop_str, ":adjust", ":yes"])
+
+        # 4. Notify user
+        try:
+            subprocess.Popen([
+                "notify-send",
+                "-u", "normal",
+                "-a", "Taskwarrior",
+                "-i", "alarm",
+                "Overnight Task Auto-Stopped",
+                f"Stopped '{desc}' at {stop_dt.strftime('%H:%M')} (lid close/sleep) to prevent overnight bleed."
+            ])
+        except Exception:
+            pass
+        return True
+
+    return False
+
 def check_and_auto_stop_adhan(active: dict, prayers: dict) -> bool:
     """If an active task started before an Adhan that has passed, stop it at Adhan time."""
     if not active or not prayers:
@@ -291,7 +350,7 @@ def check_and_auto_stop_adhan(active: dict, prayers: dict) -> bool:
                 # 2. Stop Timewarrior
                 run_cmd(["timew", "stop", ":yes"])
                 # 3. Set end time of @1 to exact prayer time
-                p_time_str = p_dt_local.strftime("%H:%M:%S")
+                p_time_str = p_dt_local.strftime("%Y-%m-%dT%H:%M:%S")
                 run_cmd(["timew", "modify", "end", "@1", p_time_str, ":adjust", ":yes"])
 
                 # 4. Notify user
@@ -501,10 +560,13 @@ def get_status() -> dict:
     next_prayer = get_next_prayer(prayers)
     auto_stop_adhan = get_adhan_config()
 
-    if active and auto_stop_adhan:
-        stopped = check_and_auto_stop_adhan(active, prayers)
-        if stopped:
+    if active:
+        if check_and_auto_stop_overnight(active):
             active = None
+        elif auto_stop_adhan:
+            stopped = check_and_auto_stop_adhan(active, prayers)
+            if stopped:
+                active = None
 
     last_entry = get_last_entry()
     today_sec = get_today_seconds()
